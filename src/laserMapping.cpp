@@ -578,19 +578,38 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
+void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap, double map_decay_time)
 {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
     int size = laserCloudFullRes->points.size();
     PointCloudXYZI::Ptr laserCloudWorld( \
                     new PointCloudXYZI(size, 1));
 
+    // Use relative time (seconds since first scan) to avoid float32 precision loss
+    double relative_time = lidar_end_time - first_lidar_time;
+
     for (int i = 0; i < size; i++)
     {
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
+        // Store relative timestamp in curvature field for decay filtering
+        laserCloudWorld->points[i].curvature = relative_time;
     }
     *pcl_wait_pub += *laserCloudWorld;
+
+    // Filter out points older than map_decay_time (if enabled)
+    if (map_decay_time > 0) {
+        PointCloudXYZI::Ptr filtered(new PointCloudXYZI());
+        filtered->points.reserve(pcl_wait_pub->points.size());
+        for (const auto& pt : pcl_wait_pub->points) {
+            if (relative_time - pt.curvature < map_decay_time) {
+                filtered->points.push_back(pt);
+            }
+        }
+        filtered->width = filtered->points.size();
+        filtered->height = 1;
+        *pcl_wait_pub = *filtered;
+    }
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
@@ -804,6 +823,7 @@ public:
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
+        this->declare_parameter<double>("publish.map_decay_time", -1.0);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -840,6 +860,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
+        this->get_parameter_or<double>("publish.map_decay_time", map_decay_time_, 30.0);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -1109,7 +1130,7 @@ private:
 
     void map_publish_callback()
     {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
+        if (map_pub_en) publish_map(pubLaserCloudMap_, map_decay_time_);
     }
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
@@ -1145,6 +1166,7 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
+    double map_decay_time_ = -1.0;  // Time in seconds to keep points in /Laser_map (-1 = infinite)
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
